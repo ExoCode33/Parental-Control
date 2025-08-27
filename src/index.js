@@ -142,8 +142,7 @@ async function onReady() {
   }
 }
 
-client.once('clientReady', onReady);
-client.once('ready', onReady);
+client.once('clientReady', onReady); // use clientReady only to avoid deprecation warning
 
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
@@ -261,6 +260,11 @@ async function evaluateGuild(guild) {
 
     lastJoinAt.set(guild.id, now);
     log(`Joined #${targetChannel.name} because ${watchers[0]} & ${watchers[1]} are alone together.`);
+
+    if (!fs.existsSync(SOUND_FILE)) {
+      log('[PC] No JOIN_AUDIO/SOUND_FILE found on disk — skipping audio.');
+      return;
+    }
 
     try {
       if (fs.existsSync(SOUND_FILE)) {
