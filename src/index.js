@@ -161,7 +161,12 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
   await reconcileGuild(guild);
 });
 
-client.once('ready', async () => {
+// Only use clientReady (no deprecation)
+let didReady = false;
+client.once('clientReady', async () => {
+  if (didReady) return;
+  didReady = true;
+
   console.log(`[READY] Logged in as ${client.user.tag}. Watching ${USER_A_ID} & ${USER_B_ID}.`);
   for (const [, guild] of client.guilds.cache) {
     await reconcileGuild(guild);
