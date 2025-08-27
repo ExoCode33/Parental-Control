@@ -1,28 +1,26 @@
-// Parental Control bot — joins a voice channel ONLY when two specific users are alone together
-// - Watches exactly two user IDs (env: WATCH_ID_1, WATCH_ID_2)
-// - When BOTH are in the same voice channel and there are NO other human users there, the bot joins and plays a sound once
-// - If anyone else joins the channel or one of them leaves, the bot disconnects
-// - Includes detailed logs so you can verify tracking
+// Parental Control bot — ESM version
+// Joins a voice channel ONLY when two specific users are alone together.
+// Presence shows: "Watching youeatra".
 
-require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, ChannelType, ActivityType } = require('discord.js');
-const {
+import 'dotenv/config';
+import { Client, GatewayIntentBits, Partials, ChannelType, ActivityType } from 'discord.js';
+import {
   joinVoiceChannel,
   getVoiceConnection,
   createAudioPlayer,
   createAudioResource,
   AudioPlayerStatus,
   NoSubscriberBehavior,
-} = require('@discordjs/voice');
-const path = require('path');
-const fs = require('fs');
+} from '@discordjs/voice';
+import path from 'path';
+import fs from 'fs';
 
 // === CONFIG ===
 const TOKEN = process.env.DISCORD_TOKEN || process.env.TOKEN;
 const WATCH_ID_1 = process.env.WATCH_ID_1; // e.g. 928099760789925970
 const WATCH_ID_2 = process.env.WATCH_ID_2; // e.g. 1148307120547176470
 
-// Join sound (absolute or relative path). Example from user:
+// Join sound path (relative to process.cwd()). Example from user:
 // sounds/dun-dun-dun-sound-effect-brass_8nFBccR.mp3
 const SOUND_FILE = process.env.SOUND_FILE || 'sounds/dun-dun-dun-sound-effect-brass_8nFBccR.mp3';
 
@@ -54,7 +52,8 @@ function log(...args) {
   console.log('[PC]', ...args);
 }
 
-client.once('ready', async () => {
+// Use the new v15-safe event name. (On v14 this also fires via alias.)
+client.once('clientReady', async () => {
   log(`Logged in as ${client.user.tag}. Watching ${WATCH_ID_1} & ${WATCH_ID_2}.`);
 
   // === Set rich presence: "Watching youeatra" ===
@@ -64,7 +63,7 @@ client.once('ready', async () => {
   });
 
   // On boot, check all guilds once
-  for (const [guildId, guild] of client.guilds.cache) {
+  for (const [, guild] of client.guilds.cache) {
     try {
       await guild.members.fetch({ withPresences: false }).catch(() => {});
       await evaluateGuild(guild);
@@ -104,7 +103,7 @@ async function evaluateGuild(guild) {
   const voiceChannels = guild.channels.cache.filter(c => c && (c.type === ChannelType.GuildVoice || c.type === ChannelType.GuildStageVoice));
   let targetChannel = null;
 
-  for (const [id, channel] of voiceChannels) {
+  for (const [, channel] of voiceChannels) {
     // Exclude AFK channels if desired (optional)
     // if (guild.afkChannelId && channel.id === guild.afkChannelId) continue;
 
