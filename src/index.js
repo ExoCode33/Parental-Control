@@ -1,10 +1,9 @@
 // Parental Control bot — ESM index.js (full file with runtime setup)
 // Joins a voice channel ONLY when two specific users are alone together.
 // Presence shows: "Watching youeatra".
-// If watcher IDs are not set via env, you can set them at runtime with slash commands:
-//   /pc_set user1:@User user2:@User
-//   /pc_status
-//   /pc_clear
+// Supports env names: DISCORD_TOKEN, USER_A_ID, USER_B_ID, JOIN_AUDIO, JOIN_VOLUME, DEBUG
+// Also supports: WATCH_IDS, WATCH_ID_1, WATCH_ID_2, SOUND_FILE, COOLDOWN_MS
+// Runtime setup (if env missing): /pc_set, /pc_status, /pc_clear (saved to watchers.json)
 
 import 'dotenv/config';
 import { Client, GatewayIntentBits, Partials, ChannelType, ActivityType } from 'discord.js';
@@ -19,14 +18,25 @@ import {
 import fs from 'fs';
 import path from 'path';
 
-// === CONFIG ===
+// === CONFIG (reads multiple env variants to match your setup) ===
 const TOKEN = process.env.DISCORD_TOKEN || process.env.TOKEN;
-const WATCH_ID_1 = process.env.WATCH_ID_1; // e.g. 928099760789925970
-const WATCH_ID_2 = process.env.WATCH_ID_2; // e.g. 1148307120547176470
-const WATCH_IDS_COMBINED = process.env.WATCH_IDS || '';
-// Default to your provided welcome sound (override with SOUND_FILE env var)
-const SOUND_FILE = process.env.SOUND_FILE || 'sounds/The Going Merry One Piece.ogg';
+
+// Watcher IDs (prefer combined WATCH_IDS, else USER_A_ID/USER_B_ID, else WATCH_ID_1/WATCH_ID_2)
+const ENV_USER_A = process.env.USER_A_ID || process.env.WATCH_ID_1;
+const ENV_USER_B = process.env.USER_B_ID || process.env.WATCH_ID_2;
+const ENV_COMBINED = process.env.WATCH_IDS || '';
+
+// Audio path & volume (JOIN_AUDIO/JOIN_VOLUME aliases supported)
+const SOUND_FILE = process.env.SOUND_FILE || process.env.JOIN_AUDIO || 'sounds/The Going Merry One Piece.ogg';
+const JOIN_VOLUME = (() => {
+  const v = parseFloat(process.env.JOIN_VOLUME);
+  if (Number.isFinite(v)) return Math.max(0, Math.min(2, v)); // clamp 0..2
+  return 0.75;
+})();
+
+// Cooldown ms and debug flag
 const COOLDOWN_MS = Number(process.env.COOLDOWN_MS || 8000);
+const DEBUG = ['1','true','yes','on'].includes(String(process.env.DEBUG || '').toLowerCase());
 
 if (!TOKEN) {
   throw new Error('Missing DISCORD_TOKEN (or TOKEN) in environment');
@@ -48,10 +58,10 @@ function saveWatchersToFile(ids) {
 }
 
 let watchers = [];
-const combined = WATCH_IDS_COMBINED.split(',').map(s => s.trim()).filter(Boolean);
-const pair = [WATCH_ID_1, WATCH_ID_2].filter(Boolean);
-if (combined.length === 2) watchers = combined.map(String);
-else if (pair.length === 2) watchers = pair.map(String);
+const fromCombined = ENV_COMBINED.split(',').map(s => s.trim()).filter(Boolean);
+const fromUserAB = [ENV_USER_A, ENV_USER_B].filter(Boolean);
+if (fromCombined.length === 2) watchers = fromCombined.map(String);
+else if (fromUserAB.length === 2) watchers = fromUserAB.map(String);
 else watchers = loadWatchersFromFile();
 
 if (!fs.existsSync(SOUND_FILE)) {
@@ -81,7 +91,19 @@ async function onReady() {
   if (watchers.length === 2) {
     log(`Watching ${watchers[0]} & ${watchers[1]}.`);
   } else {
-    log('No watcher IDs configured yet. Use /pc_set to configure two users, or set WATCH_IDS/ WATCH_ID_1 & WATCH_ID_2 and restart.');
+    log('No watcher IDs configured yet. Use /pc_set to configure two users, or set WATCH_IDS / USER_A_ID+USER_B_ID and restart.');
+  }
+
+  if (DEBUG) {
+    log('DEBUG env snapshot:', {
+      DISCORD_TOKEN: TOKEN ? '***' : 'missing',
+      USER_A_ID: process.env.USER_A_ID,
+      USER_B_ID: process.env.USER_B_ID,
+      WATCH_IDS: ENV_COMBINED,
+      SOUND_FILE,
+      JOIN_VOLUME,
+      COOLDOWN_MS,
+    });
   }
 
   // Presence
@@ -91,7 +113,6 @@ async function onReady() {
   const commands = [
     {
       name: 'pc_set', description: 'Set the two watched users',
-      default_member_permissions: '0', // manage who can use via Discord perms if desired
       options: [
         { name: 'user1', description: 'First user', type: 6, required: true },
         { name: 'user2', description: 'Second user', type: 6, required: true },
@@ -104,7 +125,7 @@ async function onReady() {
   for (const [, guild] of client.guilds.cache) {
     try {
       await guild.commands.set(commands);
-      log(`Slash commands registered in guild: ${guild.name}`);
+      if (DEBUG) log(`Slash commands registered in guild: ${guild.name}`);
     } catch (e) {
       console.error('[PC] Failed to register commands:', e?.message || e);
     }
@@ -136,7 +157,6 @@ client.on('interactionCreate', async (interaction) => {
       watchers = [u1.id, u2.id];
       saveWatchersToFile(watchers);
       await interaction.reply({ content: `Watching <@${u1.id}> & <@${u2.id}>.`, ephemeral: true });
-      // Re-evaluate guild state now
       await evaluateGuild(interaction.guild);
       return;
     }
@@ -151,7 +171,6 @@ client.on('interactionCreate', async (interaction) => {
       watchers = [];
       saveWatchersToFile(watchers);
       await interaction.reply({ content: 'Cleared watchers. Use `/pc_set` to configure.', ephemeral: true });
-      // Disconnect if currently connected, since rule can no longer be true
       try { getVoiceConnection(interaction.guild.id)?.destroy(); } catch {}
       return;
     }
@@ -208,7 +227,7 @@ async function evaluateGuild(guild) {
     const bothInside = memberIds.has(W1) && memberIds.has(W2);
     const onlyTwo = members.size === 2;
 
-    if (bothInside) {
+    if (DEBUG && bothInside) {
       log(`[check] ${channel.name}: humans=${members.size} | contains both=${bothInside}`);
     }
 
@@ -221,12 +240,12 @@ async function evaluateGuild(guild) {
     const since = now - prev;
 
     if (existing && existing.joinConfig.channelId === targetChannel.id) {
-      log(`Already connected to #${targetChannel.name}.`);
+      if (DEBUG) log(`Already connected to #${targetChannel.name}.`);
       return;
     }
 
     if (since < COOLDOWN_MS) {
-      log(`Within cooldown (${since}ms < ${COOLDOWN_MS}ms). Skipping re-join.`);
+      if (DEBUG) log(`Within cooldown (${since}ms < ${COOLDOWN_MS}ms). Skipping re-join.`);
       return;
     }
 
@@ -247,10 +266,10 @@ async function evaluateGuild(guild) {
       if (fs.existsSync(SOUND_FILE)) {
         const player = createAudioPlayer({ behavior: NoSubscriberBehavior.Pause });
         const resource = createAudioResource(SOUND_FILE, { inlineVolume: true });
-        if (resource.volume) resource.volume.setVolume(0.75);
+        if (resource.volume) resource.volume.setVolume(JOIN_VOLUME);
         connection.subscribe(player);
         player.play(resource);
-        log(`Playing join sound: ${path.basename(SOUND_FILE)}`);
+        log(`Playing join sound: ${path.basename(SOUND_FILE)} @ volume ${JOIN_VOLUME}`);
         player.once(AudioPlayerStatus.Idle, () => log('Join sound finished. Staying connected until state changes.'));
         player.on('error', (e) => console.error('[PC] Audio player error:', e?.message || e));
       }
