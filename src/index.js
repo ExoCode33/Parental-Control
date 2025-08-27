@@ -1,4 +1,18 @@
-// Parental Control bot — ESM version
+if (!TOKEN) throw new Error('Missing DISCORD_TOKEN (or TOKEN) in environment');
+
+// Build the watcher list from either the split variables or the combined one
+const watcherList = (() => {
+  if (WATCH_IDS_COMBINED) return WATCH_IDS_COMBINED.split(',').map(s => s.trim()).filter(Boolean);
+  return [WATCH_ID_1, WATCH_ID_2].filter(Boolean);
+})();
+
+if (watcherList.length !== 2) {
+  console.error('[PC] Missing watcher IDs. Set either WATCH_ID_1 and WATCH_ID_2, or WATCH_IDS="id1,id2"');
+  console.error('[PC] Current values:', { WATCH_ID_1, WATCH_ID_2, WATCH_IDS: WATCH_IDS_COMBINED });
+  throw new Error('Missing or incomplete watcher IDs in environment');
+}
+
+const [W1, W2] = watcherList.map(String);const SOUND_FILE = process.env.SOUND_FILE || 'sounds/The Going Merry One Piece.ogg';// Parental Control bot — ESM version
 // Joins a voice channel ONLY when two specific users are alone together.
 // Presence shows: "Watching youeatra".
 
@@ -19,6 +33,8 @@ import fs from 'fs';
 const TOKEN = process.env.DISCORD_TOKEN || process.env.TOKEN;
 const WATCH_ID_1 = process.env.WATCH_ID_1; // e.g. 928099760789925970
 const WATCH_ID_2 = process.env.WATCH_ID_2; // e.g. 1148307120547176470
+// Optional combined form: WATCH_IDS="id1,id2"
+const WATCH_IDS_COMBINED = process.env.WATCH_IDS;
 
 // Join sound path (relative to process.cwd()). Example from user:
 // sounds/dun-dun-dun-sound-effect-brass_8nFBccR.mp3
@@ -34,7 +50,7 @@ if (!fs.existsSync(SOUND_FILE)) {
   console.warn(`[WARN] Join sound file not found at ${SOUND_FILE}. The bot will still join silently.`);
 }
 
-const WATCHED = new Set([String(WATCH_ID_1), String(WATCH_ID_2)]);
+const WATCHED = new Set([W1, W2]);
 
 const client = new Client({
   intents: [
@@ -54,7 +70,7 @@ function log(...args) {
 
 // Use the new v15-safe event name. (On v14 this also fires via alias.)
 client.once('clientReady', async () => {
-  log(`Logged in as ${client.user.tag}. Watching ${WATCH_ID_1} & ${WATCH_ID_2}.`);
+  log(`Logged in as ${client.user.tag}. Watching ${W1} & ${W2}.`);
 
   // === Set rich presence: "Watching youeatra" ===
   client.user.setPresence({
@@ -156,7 +172,7 @@ async function evaluateGuild(guild) {
     });
 
     lastJoinAt.set(guild.id, now);
-    log(`Joined #${targetChannel.name} because ${WATCH_ID_1} & ${WATCH_ID_2} are alone together.`);
+    log(`Joined #${targetChannel.name} because ${W1} & ${W2} are alone together.`);
 
     // Play the sound once, if provided
     try {
