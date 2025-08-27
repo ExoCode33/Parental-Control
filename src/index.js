@@ -5,7 +5,7 @@
 // - Includes detailed logs so you can verify tracking
 
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, ChannelType } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, ChannelType, ActivityType } = require('discord.js');
 const {
   joinVoiceChannel,
   getVoiceConnection,
@@ -56,6 +56,13 @@ function log(...args) {
 
 client.once('ready', async () => {
   log(`Logged in as ${client.user.tag}. Watching ${WATCH_ID_1} & ${WATCH_ID_2}.`);
+
+  // === Set rich presence: "Watching youeatra" ===
+  client.user.setPresence({
+    activities: [{ name: 'youeatra', type: ActivityType.Watching }],
+    status: 'online',
+  });
+
   // On boot, check all guilds once
   for (const [guildId, guild] of client.guilds.cache) {
     try {
@@ -176,4 +183,30 @@ async function evaluateGuild(guild) {
       console.error('[PC] Failed to play join sound:', e?.message || e);
     }
   } else {
-    // No channel meets the condition → disconnec
+    // No channel meets the condition → disconnect if connected
+    if (existing) {
+      const ch = guild.channels.cache.get(existing.joinConfig.channelId);
+      try {
+        existing.destroy();
+        log(`Left #${ch?.name || existing.joinConfig.channelId} (no longer alone together).`);
+      } catch (e) {
+        console.error('[PC] Failed to leave voice:', e?.message || e);
+      }
+    }
+  }
+}
+
+// Safety: also leave when the bot is manually disconnected or the guild becomes unavailable
+client.on('guildUnavailable', (guild) => {
+  const existing = getVoiceConnection(guild.id);
+  try { existing?.destroy(); } catch {}
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('[PC] Unhandled rejection:', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[PC] Uncaught exception:', err);
+});
+
+client.login(TOKEN);
