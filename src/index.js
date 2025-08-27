@@ -1,232 +1,179 @@
-import 'dotenv/config';
-import {
-  Client,
-  GatewayIntentBits,
-  Partials,
-  PermissionsBitField,
-} from 'discord.js';
-import {
+// Parental Control bot — joins a voice channel ONLY when two specific users are alone together
+// - Watches exactly two user IDs (env: WATCH_ID_1, WATCH_ID_2)
+// - When BOTH are in the same voice channel and there are NO other human users there, the bot joins and plays a sound once
+// - If anyone else joins the channel or one of them leaves, the bot disconnects
+// - Includes detailed logs so you can verify tracking
+
+require('dotenv').config();
+const { Client, GatewayIntentBits, Partials, ChannelType } = require('discord.js');
+const {
   joinVoiceChannel,
+  getVoiceConnection,
   createAudioPlayer,
   createAudioResource,
-  NoSubscriberBehavior,
   AudioPlayerStatus,
-  VoiceConnectionStatus,
-  entersState,
-  getVoiceConnection
-} from '@discordjs/voice';
-import fs from 'node:fs';
-import path from 'node:path';
-import prism from 'prism-media';
-import ffmpeg from 'ffmpeg-static';
+  NoSubscriberBehavior,
+} = require('@discordjs/voice');
+const path = require('path');
+const fs = require('fs');
 
-// ======= ENV =======
-const TOKEN = process.env.DISCORD_TOKEN;
-const USER_A_ID = process.env.USER_A_ID?.trim();
-const USER_B_ID = process.env.USER_B_ID?.trim();
+// === CONFIG ===
+const TOKEN = process.env.DISCORD_TOKEN || process.env.TOKEN;
+const WATCH_ID_1 = process.env.WATCH_ID_1; // e.g. 928099760789925970
+const WATCH_ID_2 = process.env.WATCH_ID_2; // e.g. 1148307120547176470
 
-// Join sound (new): use JOIN_AUDIO first, then WELCOME_AUDIO (back-compat), else default path
-const JOIN_AUDIO = process.env.JOIN_AUDIO || process.env.WELCOME_AUDIO || 'sounds/The Going Merry One Piece.ogg';
-const JOIN_VOLUME = Math.min(1, Math.max(0, Number(process.env.JOIN_VOLUME) || 1));
+// Join sound (absolute or relative path). Example from user:
+// sounds/dun-dun-dun-sound-effect-brass_8nFBccR.mp3
+const SOUND_FILE = process.env.SOUND_FILE || 'sounds/dun-dun-dun-sound-effect-brass_8nFBccR.mp3';
 
-const DEBUG = process.env.DEBUG === '1'; // set DEBUG=1 for verbose logs
+// Optional: cool-down to avoid reconnect spam (ms)
+const COOLDOWN_MS = Number(process.env.COOLDOWN_MS || 8000);
 
-if (!TOKEN) throw new Error('Missing DISCORD_TOKEN');
-if (!USER_A_ID) throw new Error('Missing USER_A_ID');
-if (!USER_B_ID) throw new Error('Missing USER_B_ID');
+if (!TOKEN) throw new Error('Missing DISCORD_TOKEN (or TOKEN) in environment');
+if (!WATCH_ID_1 || !WATCH_ID_2) throw new Error('Missing WATCH_ID_1 or WATCH_ID_2 in environment');
 
-// ======= LOG HELPERS =======
-const log = (...a) => console.log('[BOT]', ...a);
-const warn = (...a) => console.warn('[WARN]', ...a);
-const err = (...a) => console.error('[ERR]', ...a);
-const dbg = (...a) => { if (DEBUG) console.log('[DEBUG]', ...a); };
+if (!fs.existsSync(SOUND_FILE)) {
+  console.warn(`[WARN] Join sound file not found at ${SOUND_FILE}. The bot will still join silently.`);
+}
 
-// ======= CLIENT =======
+const WATCHED = new Set([String(WATCH_ID_1), String(WATCH_ID_2)]);
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMembers,
   ],
-  partials: [Partials.GuildMember],
+  partials: [Partials.GuildMember, Partials.User],
 });
 
-// ======= AUDIO =======
-const players = new Map(); // guildId -> AudioPlayer
+// Track last join time per guild to prevent rapid re-joins
+const lastJoinAt = new Map(); // guildId -> timestamp
 
-function getOrCreatePlayer(guildId) {
-  if (players.has(guildId)) return players.get(guildId);
-  const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
-  player.on('error', (e) => err(`Audio player error (guild ${guildId}):`, e?.message));
-  player.on(AudioPlayerStatus.Idle, () => {});
-  players.set(guildId, player);
-  return player;
+function log(...args) {
+  console.log('[PC]', ...args);
 }
 
-async function playJoinSound(player) {
-  const fullPath = path.isAbsolute(JOIN_AUDIO) ? JOIN_AUDIO : path.join(process.cwd(), JOIN_AUDIO);
-
-  if (!fs.existsSync(fullPath)) {
-    dbg('Join sound not found, skipping:', fullPath);
-    return;
-  }
-
-  try {
-    log(`[SOUND] join -> ${fullPath} (vol=${JOIN_VOLUME})`);
-    const ff = new prism.FFmpeg({
-      args: ['-hide_banner','-loglevel','error','-i', fullPath,'-f','s16le','-ar','48000','-ac','2'],
-      shell: false,
-      executable: ffmpeg || undefined,
-    });
-    const opus = new prism.opus.Encoder({ rate: 48000, channels: 2, frameSize: 960 });
-    const stream = ff.pipe(opus);
-
-    const resource = createAudioResource(stream, { inlineVolume: true });
-    if (resource.volume) resource.volume.setVolume(JOIN_VOLUME);
-
-    player.play(resource);
-  } catch (e) {
-    err('Failed to play join sound:', e?.message);
-  }
-}
-
-async function connectAndGreet(channel) {
-  const guildId = channel.guild.id;
-
-  // move if already connected
-  let conn = getVoiceConnection(guildId);
-  if (conn) {
-    if (conn.joinConfig.channelId === channel.id) return conn;
-    log(`[MOVE] ${channel.guild.name}: -> #${channel.name} (${channel.id})`);
-    conn.destroy();
-  } else {
-    log(`[JOIN] ${channel.guild.name}: #${channel.name} (${channel.id})`);
-  }
-
-  // connect
-  let connection;
-  try {
-    connection = joinVoiceChannel({
-      channelId: channel.id,
-      guildId,
-      adapterCreator: channel.guild.voiceAdapterCreator,
-      selfDeaf: true,
-    });
-    await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
-  } catch (e) {
-    err(`Failed to connect to "${channel.name}" in ${channel.guild.name}:`, e?.message);
-    try { connection?.destroy(); } catch {}
-    return null;
-  }
-
-  // subscribe a player & play the join sound
-  const player = getOrCreatePlayer(guildId);
-  connection.subscribe(player);
-  await playJoinSound(player);
-
-  // resilience
-  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+client.once('ready', async () => {
+  log(`Logged in as ${client.user.tag}. Watching ${WATCH_ID_1} & ${WATCH_ID_2}.`);
+  // On boot, check all guilds once
+  for (const [guildId, guild] of client.guilds.cache) {
     try {
-      await Promise.race([
-        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-      ]);
-      dbg('Voice connection recovered after Disconnected.');
-    } catch {
-      log(`[LEAVE] ${channel.guild.name}: voice connection closed`);
-      connection.destroy();
+      await guild.members.fetch({ withPresences: false }).catch(() => {});
+      await evaluateGuild(guild);
+    } catch (e) {
+      console.error('[PC] Initial evaluateGuild error:', e?.message || e);
     }
-  });
-
-  return connection;
-}
-
-// ======= LOGIC =======
-async function resolveTargetChannel(guild) {
-  try {
-    const [mA, mB] = await Promise.all([
-      guild.members.fetch(USER_A_ID).catch(() => null),
-      guild.members.fetch(USER_B_ID).catch(() => null),
-    ]);
-
-    if (!mA) dbg(`[TRACK] USER_A_ID ${USER_A_ID} not found in guild ${guild.name}`);
-    if (!mB) dbg(`[TRACK] USER_B_ID ${USER_B_ID} not found in guild ${guild.name}`);
-
-    const chA = mA?.voice?.channel ?? null;
-    const chB = mB?.voice?.channel ?? null;
-
-    dbg(`[CHECK] ${guild.name}: A in ${chA ? `#${chA.name}(${chA.id})` : 'none'}; B in ${chB ? `#${chB.name}(${chB.id})` : 'none'}`);
-
-    if (!chA || !chB) return null;
-    if (chA.id !== chB.id) return null;
-
-    log(`[MATCH] ${guild.name}: both users are in #${chA.name} (${chA.id})`);
-    return chA; // both in same VC
-  } catch (e) {
-    dbg(`[CHECK] ${guild.name}: resolveTargetChannel error: ${e?.message}`);
-    return null;
   }
-}
+});
 
-async function reconcileGuild(guild) {
-  try {
-    const target = await resolveTargetChannel(guild);
-    const conn = getVoiceConnection(guild.id);
-
-    if (target) {
-      const me = guild.members.me || await guild.members.fetchMe();
-      const perms = target.permissionsFor(me);
-      if (!perms?.has(PermissionsBitField.Flags.Connect)) {
-        warn(`[PERM] Missing Connect in #${target.name} (${guild.name})`);
-        if (conn) conn.destroy();
-        return;
-      }
-      if (!conn || conn.joinConfig.channelId !== target.id) {
-        await connectAndGreet(target);
-      } else {
-        dbg(`[OK] Already in correct channel #${target.name} (${target.id})`);
-      }
-    } else {
-      if (conn) {
-        log(`[LEAVE] ${guild.name}: users no longer together`);
-        conn.destroy();
-      } else {
-        dbg(`[IDLE] ${guild.name}: no match; not connected`);
-      }
-    }
-  } catch (e) {
-    err(`[RECONCILE] ${guild.name}:`, e?.message);
-  }
-}
-
-// ======= EVENTS =======
 client.on('voiceStateUpdate', async (oldState, newState) => {
-  const uid = (newState.member || oldState.member)?.id;
-  const before = oldState.channelId || 'none';
-  const after = newState.channelId || 'none';
-  if (uid === USER_A_ID || uid === USER_B_ID) {
-    dbg(`[TRACK] voiceStateUpdate for ${uid}: ${before} -> ${after}`);
-  } else {
-    dbg(`[SKIP] voiceStateUpdate for untracked user ${uid}: ${before} -> ${after}`);
-  }
+  // Only react inside the guild where change happened
   const guild = newState.guild || oldState.guild;
-  await reconcileGuild(guild);
-});
+  if (!guild) return;
 
-// Only use clientReady (no deprecation)
-let didReady = false;
-client.once('clientReady', async () => {
-  if (didReady) return;
-  didReady = true;
+  // Log interesting transitions for tracked users
+  const userId = newState.id || oldState.id;
+  if (WATCHED.has(userId)) {
+    const before = oldState?.channel ? `${oldState.channel?.name} (${oldState.channelId})` : 'none';
+    const after = newState?.channel ? `${newState.channel?.name} (${newState.channelId})` : 'none';
+    log(`Tracked user ${userId} moved: ${before} → ${after}`);
+  }
 
-  log(`[READY] Logged in as ${client.user.tag}. Watching ${USER_A_ID} & ${USER_B_ID}. DEBUG=${DEBUG ? 'on' : 'off'}`);
-  for (const [, guild] of client.guilds.cache) {
-    await reconcileGuild(guild);
+  try {
+    await evaluateGuild(guild);
+  } catch (e) {
+    console.error('[PC] evaluateGuild error:', e?.message || e);
   }
 });
 
-client.on('error', (e) => err('Client error:', e?.message));
-process.on('unhandledRejection', (e) => err('UnhandledRejection:', e));
-process.on('uncaughtException', (e) => err('UncaughtException:', e));
+/**
+ * Evaluate a guild to see if the two watched users are alone together in any voice channel.
+ * If yes → ensure we are connected there (and play sound once if freshly joined).
+ * If not → disconnect if connected.
+ */
+async function evaluateGuild(guild) {
+  // Find voice-like channels
+  const voiceChannels = guild.channels.cache.filter(c => c && (c.type === ChannelType.GuildVoice || c.type === ChannelType.GuildStageVoice));
+  let targetChannel = null;
 
-// ======= START =======
-client.login(TOKEN);
+  for (const [id, channel] of voiceChannels) {
+    // Exclude AFK channels if desired (optional)
+    // if (guild.afkChannelId && channel.id === guild.afkChannelId) continue;
+
+    const members = channel.members.filter(m => !m.user.bot); // humans only
+    const memberIds = new Set(members.map(m => m.id));
+    const bothInside = [...WATCHED].every(uid => memberIds.has(uid));
+    const onlyTwo = members.size === 2;
+
+    if (bothInside) {
+      log(`[check] ${channel.name}: humans=${members.size} | contains both=${bothInside}`);
+    }
+
+    if (bothInside && onlyTwo) {
+      targetChannel = channel;
+      break; // Found the channel where they are alone together
+    }
+  }
+
+  const existing = getVoiceConnection(guild.id);
+
+  if (targetChannel) {
+    // Cooldown check
+    const now = Date.now();
+    const prev = lastJoinAt.get(guild.id) || 0;
+    const since = now - prev;
+
+    if (existing && existing.joinConfig.channelId === targetChannel.id) {
+      // Already connected to the correct channel — nothing to do
+      log(`Already connected to #${targetChannel.name}.`);
+      return;
+    }
+
+    if (since < COOLDOWN_MS) {
+      log(`Within cooldown (${since}ms < ${COOLDOWN_MS}ms). Skipping re-join.`);
+      return;
+    }
+
+    // If connected elsewhere in this guild, move connection
+    if (existing) {
+      try { existing.destroy(); } catch {}
+    }
+
+    // Join the target channel
+    const connection = joinVoiceChannel({
+      channelId: targetChannel.id,
+      guildId: targetChannel.guild.id,
+      adapterCreator: targetChannel.guild.voiceAdapterCreator,
+      selfDeaf: false,
+      selfMute: false,
+    });
+
+    lastJoinAt.set(guild.id, now);
+    log(`Joined #${targetChannel.name} because ${WATCH_ID_1} & ${WATCH_ID_2} are alone together.`);
+
+    // Play the sound once, if provided
+    try {
+      if (fs.existsSync(SOUND_FILE)) {
+        const player = createAudioPlayer({ behavior: NoSubscriberBehavior.Pause });
+        const resource = createAudioResource(SOUND_FILE, { inlineVolume: true });
+        if (resource.volume) resource.volume.setVolume(0.75);
+
+        connection.subscribe(player);
+        player.play(resource);
+        log(`Playing join sound: ${path.basename(SOUND_FILE)}`);
+
+        player.once(AudioPlayerStatus.Idle, () => {
+          // After audio finishes, keep the connection open; we will disconnect when not-alone
+          log('Join sound finished. Staying connected until state changes.');
+        });
+
+        player.on('error', (e) => {
+          console.error('[PC] Audio player error:', e?.message || e);
+        });
+      }
+    } catch (e) {
+      console.error('[PC] Failed to play join sound:', e?.message || e);
+    }
+  } else {
+    // No channel meets the condition → disconnec
