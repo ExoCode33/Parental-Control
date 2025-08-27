@@ -12,7 +12,7 @@ if (watcherList.length !== 2) {
   throw new Error('Missing or incomplete watcher IDs in environment');
 }
 
-const [W1, W2] = watcherList.map(String);const SOUND_FILE = process.env.SOUND_FILE || 'sounds/The Going Merry One Piece.ogg';// Parental Control bot — ESM version
+const [W1, W2] = watcherList.map(String);// Parental Control bot — ESM version
 // Joins a voice channel ONLY when two specific users are alone together.
 // Presence shows: "Watching youeatra".
 
@@ -35,8 +35,9 @@ const WATCH_ID_1 = process.env.WATCH_ID_1; // e.g. 928099760789925970
 const WATCH_ID_2 = process.env.WATCH_ID_2; // e.g. 1148307120547176470
 // Optional combined form: WATCH_IDS="id1,id2"
 const WATCH_IDS_COMBINED = process.env.WATCH_IDS;
-// Default to your provided welcome sound
+// Default to your provided welcome sound (override with SOUND_FILE env var)
 const SOUND_FILE = process.env.SOUND_FILE || 'sounds/The Going Merry One Piece.ogg';
+// Default to your provided welcome sound
 // Optional: cool-down to avoid reconnect spam (ms)
 const COOLDOWN_MS = Number(process.env.COOLDOWN_MS || 8000);
 
