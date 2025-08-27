@@ -72,9 +72,8 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildMembers,
   ],
-  partials: [Partials.GuildMember, Partials.User],
+  partials: [],
 });
 
 // Track last join time per guild to prevent rapid re-joins
@@ -134,7 +133,6 @@ async function onReady() {
   // Initial scan
   for (const [, guild] of client.guilds.cache) {
     try {
-      await guild.members.fetch({ withPresences: false }).catch(() => {});
       await evaluateGuild(guild);
     } catch (e) {
       console.error('[PC] Initial evaluateGuild error:', e?.message || e);
@@ -221,19 +219,23 @@ async function evaluateGuild(guild) {
   let targetChannel = null;
 
   for (const [, channel] of voiceChannels) {
-    // Separate humans vs bots so bots (including this bot) never count toward the "two people" rule
-    const humans = channel.members.filter(m => !m.user.bot);
-    const bots = channel.members.filter(m => m.user.bot);
-    const memberIds = new Set(humans.map(m => m.id));
+    // Build human list using voice state cache (does NOT require privileged member intent)
+    const states = guild.voiceStates.cache.filter(s => s.channelId === channel.id);
+    const ids = [...states.keys()];
+    const botIds = new Set(
+      [...states.values()]
+        .filter(s => (s.member?.user?.bot === true) || s.id === client.user.id)
+        .map(s => s.id)
+    );
+    const humanIds = ids.filter(id => !botIds.has(id));
 
-    const bothInside = memberIds.has(W1) && memberIds.has(W2);
-    const onlyTwoHumans = humans.size === 2;
+    const bothInside = humanIds.includes(W1) && humanIds.includes(W2);
+    const onlyTwoHumans = humanIds.length === 2;
 
     if (DEBUG) {
-      log(`[check] ${channel.name}: humans=${humans.size} bots=${bots.size} total=${channel.members.size} bothInside=${bothInside} onlyTwoHumans=${onlyTwoHumans}`);
+      log(`[check] ${channel.name}: humans=${humanIds.length} bots=${botIds.size} total=${ids.length} bothInside=${bothInside} onlyTwoHumans=${onlyTwoHumans}`);
     }
 
-    // They must BOTH be in the channel AND there must be exactly two HUMANS (bots ignored)
     if (bothInside && onlyTwoHumans) { targetChannel = channel; break; }
   }
 
