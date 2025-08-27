@@ -1,18 +1,4 @@
-if (!TOKEN) throw new Error('Missing DISCORD_TOKEN (or TOKEN) in environment');
-
-// Build the watcher list from either the split variables or the combined one
-const watcherList = (() => {
-  if (WATCH_IDS_COMBINED) return WATCH_IDS_COMBINED.split(',').map(s => s.trim()).filter(Boolean);
-  return [WATCH_ID_1, WATCH_ID_2].filter(Boolean);
-})();
-
-if (watcherList.length !== 2) {
-  console.error('[PC] Missing watcher IDs. Set either WATCH_ID_1 and WATCH_ID_2, or WATCH_IDS="id1,id2"');
-  console.error('[PC] Current values:', { WATCH_ID_1, WATCH_ID_2, WATCH_IDS: WATCH_IDS_COMBINED });
-  throw new Error('Missing or incomplete watcher IDs in environment');
-}
-
-const [W1, W2] = watcherList.map(String);// Parental Control bot — ESM version
+// Parental Control bot — ESM index.js (full file)
 // Joins a voice channel ONLY when two specific users are alone together.
 // Presence shows: "Watching youeatra".
 
@@ -26,26 +12,42 @@ import {
   AudioPlayerStatus,
   NoSubscriberBehavior,
 } from '@discordjs/voice';
-import path from 'path';
 import fs from 'fs';
+import path from 'path';
 
 // === CONFIG ===
 const TOKEN = process.env.DISCORD_TOKEN || process.env.TOKEN;
 const WATCH_ID_1 = process.env.WATCH_ID_1; // e.g. 928099760789925970
 const WATCH_ID_2 = process.env.WATCH_ID_2; // e.g. 1148307120547176470
 // Optional combined form: WATCH_IDS="id1,id2"
-const WATCH_IDS_COMBINED = process.env.WATCH_IDS;
+const WATCH_IDS_COMBINED = process.env.WATCH_IDS || '';
 // Default to your provided welcome sound (override with SOUND_FILE env var)
 const SOUND_FILE = process.env.SOUND_FILE || 'sounds/The Going Merry One Piece.ogg';
-// Default to your provided welcome sound
 // Optional: cool-down to avoid reconnect spam (ms)
 const COOLDOWN_MS = Number(process.env.COOLDOWN_MS || 8000);
 
-if (!TOKEN) throw new Error('Missing DISCORD_TOKEN (or TOKEN) in environment');
-if (!WATCH_ID_1 || !WATCH_ID_2) throw new Error('Missing WATCH_ID_1 or WATCH_ID_2 in environment');
+// === Validate and build watcher list ===
+if (!TOKEN) {
+  throw new Error('Missing DISCORD_TOKEN (or TOKEN) in environment');
+}
+
+const watcherList = (() => {
+  const fromCombined = WATCH_IDS_COMBINED.split(',').map(s => s.trim()).filter(Boolean);
+  const fromPair = [WATCH_ID_1, WATCH_ID_2].filter(Boolean);
+  const list = fromCombined.length ? fromCombined : fromPair;
+  return list.map(String);
+})();
+
+if (watcherList.length !== 2) {
+  console.error('[PC] Missing watcher IDs. Set WATCH_IDS="id1,id2" or WATCH_ID_1 & WATCH_ID_2.');
+  console.error('[PC] Current values:', { WATCH_ID_1, WATCH_ID_2, WATCH_IDS: WATCH_IDS_COMBINED });
+  throw new Error('Missing or incomplete watcher IDs in environment');
+}
+
+const [W1, W2] = watcherList;
 
 if (!fs.existsSync(SOUND_FILE)) {
-  console.warn(`[WARN] Join sound file not found at ${SOUND_FILE}. The bot will still join silently.`);
+  console.warn(`[WARN] Join sound not found: ${SOUND_FILE}. Bot will join silently.`);
 }
 
 const WATCHED = new Set([W1, W2]);
@@ -62,12 +64,13 @@ const client = new Client({
 // Track last join time per guild to prevent rapid re-joins
 const lastJoinAt = new Map(); // guildId -> timestamp
 
-function log(...args) {
-  console.log('[PC]', ...args);
-}
+function log(...args) { console.log('[PC]', ...args); }
 
-// Use the new v15-safe event name. (On v14 this also fires via alias.)
-client.once('clientReady', async () => {
+let booted = false;
+async function onReady() {
+  if (booted) return; // guard if both events fire
+  booted = true;
+
   log(`Logged in as ${client.user.tag}. Watching ${W1} & ${W2}.`);
 
   // === Set rich presence: "Watching youeatra" ===
@@ -85,7 +88,11 @@ client.once('clientReady', async () => {
       console.error('[PC] Initial evaluateGuild error:', e?.message || e);
     }
   }
-});
+}
+
+// Support both event names for cross-version compatibility
+client.once('clientReady', onReady);
+client.once('ready', onReady);
 
 client.on('voiceStateUpdate', async (oldState, newState) => {
   // Only react inside the guild where change happened
@@ -123,7 +130,7 @@ async function evaluateGuild(guild) {
 
     const members = channel.members.filter(m => !m.user.bot); // humans only
     const memberIds = new Set(members.map(m => m.id));
-    const bothInside = [...WATCHED].every(uid => memberIds.has(uid));
+    const bothInside = memberIds.has(W1) && memberIds.has(W2);
     const onlyTwo = members.size === 2;
 
     if (bothInside) {
@@ -156,9 +163,7 @@ async function evaluateGuild(guild) {
     }
 
     // If connected elsewhere in this guild, move connection
-    if (existing) {
-      try { existing.destroy(); } catch {}
-    }
+    try { existing?.destroy(); } catch {}
 
     // Join the target channel
     const connection = joinVoiceChannel({
@@ -211,8 +216,7 @@ async function evaluateGuild(guild) {
 
 // Safety: also leave when the bot is manually disconnected or the guild becomes unavailable
 client.on('guildUnavailable', (guild) => {
-  const existing = getVoiceConnection(guild.id);
-  try { existing?.destroy(); } catch {}
+  try { getVoiceConnection(guild.id)?.destroy(); } catch {}
 });
 
 process.on('unhandledRejection', (err) => {
