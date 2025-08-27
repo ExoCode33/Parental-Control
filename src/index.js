@@ -221,16 +221,20 @@ async function evaluateGuild(guild) {
   let targetChannel = null;
 
   for (const [, channel] of voiceChannels) {
-    const members = channel.members.filter(m => !m.user.bot); // humans only
-    const memberIds = new Set(members.map(m => m.id));
-    const bothInside = memberIds.has(W1) && memberIds.has(W2);
-    const onlyTwo = members.size === 2;
+    // Separate humans vs bots so bots (including this bot) never count toward the "two people" rule
+    const humans = channel.members.filter(m => !m.user.bot);
+    const bots = channel.members.filter(m => m.user.bot);
+    const memberIds = new Set(humans.map(m => m.id));
 
-    if (DEBUG && bothInside) {
-      log(`[check] ${channel.name}: humans=${members.size} | contains both=${bothInside}`);
+    const bothInside = memberIds.has(W1) && memberIds.has(W2);
+    const onlyTwoHumans = humans.size === 2;
+
+    if (DEBUG) {
+      log(`[check] ${channel.name}: humans=${humans.size} bots=${bots.size} total=${channel.members.size} bothInside=${bothInside} onlyTwoHumans=${onlyTwoHumans}`);
     }
 
-    if (bothInside && onlyTwo) { targetChannel = channel; break; }
+    // They must BOTH be in the channel AND there must be exactly two HUMANS (bots ignored)
+    if (bothInside && onlyTwoHumans) { targetChannel = channel; break; }
   }
 
   if (targetChannel) {
