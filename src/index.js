@@ -35,11 +35,8 @@ const WATCH_ID_1 = process.env.WATCH_ID_1; // e.g. 928099760789925970
 const WATCH_ID_2 = process.env.WATCH_ID_2; // e.g. 1148307120547176470
 // Optional combined form: WATCH_IDS="id1,id2"
 const WATCH_IDS_COMBINED = process.env.WATCH_IDS;
-
-// Join sound path (relative to process.cwd()). Example from user:
-// sounds/dun-dun-dun-sound-effect-brass_8nFBccR.mp3
-const SOUND_FILE = process.env.SOUND_FILE || 'sounds/dun-dun-dun-sound-effect-brass_8nFBccR.mp3';
-
+// Default to your provided welcome sound
+const SOUND_FILE = process.env.SOUND_FILE || 'sounds/The Going Merry One Piece.ogg';
 // Optional: cool-down to avoid reconnect spam (ms)
 const COOLDOWN_MS = Number(process.env.COOLDOWN_MS || 8000);
 
