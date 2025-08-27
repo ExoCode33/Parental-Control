@@ -1,306 +1,236 @@
-// Parental Control bot — ESM index.js (full file with runtime setup)
-// Joins a voice channel ONLY when two specific users are alone together.
-// Presence shows: "Watching youeatra".
-// Supports env names: DISCORD_TOKEN, USER_A_ID, USER_B_ID, JOIN_AUDIO, JOIN_VOLUME, DEBUG
-// Also supports: WATCH_IDS, WATCH_ID_1, WATCH_ID_2, SOUND_FILE, COOLDOWN_MS
-// Runtime setup (if env missing): /pc_set, /pc_status, /pc_clear (saved to watchers.json)
+// src/index.js
+// DM Relay Bot — sends a DM to a chosen user and relays their DM replies back to the invoking channel.
+//
+// Env vars required:
+//   DISCORD_TOKEN = your bot token
+//   CLIENT_ID     = your application (bot) client ID
+// Optional (faster command registration while testing):
+//   GUILD_ID      = a guild to register commands to (guild-scoped). Omit to register globally.
+//
+// Intents: We do NOT request Message Content to avoid "Used disallowed intents" issues.
+// DM message content is available without that privileged intent.
 
-import 'dotenv/config';
-import { Client, GatewayIntentBits, Partials, ChannelType, ActivityType } from 'discord.js';
-import {
-  joinVoiceChannel,
-  getVoiceConnection,
-  createAudioPlayer,
-  createAudioResource,
-  AudioPlayerStatus,
-  NoSubscriberBehavior,
-} from '@discordjs/voice';
-import fs from 'fs';
-import path from 'path';
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  Events,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+} = require('discord.js');
 
-// === CONFIG (reads multiple env variants to match your setup) ===
-const TOKEN = process.env.DISCORD_TOKEN || process.env.TOKEN;
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID;
+const GUILD_ID = process.env.GUILD_ID || null;
 
-// Watcher IDs (prefer combined WATCH_IDS, else USER_A_ID/USER_B_ID, else WATCH_ID_1/WATCH_ID_2)
-const ENV_USER_A = process.env.USER_A_ID || process.env.WATCH_ID_1;
-const ENV_USER_B = process.env.USER_B_ID || process.env.WATCH_ID_2;
-const ENV_COMBINED = process.env.WATCH_IDS || '';
+if (!DISCORD_TOKEN) throw new Error('Missing DISCORD_TOKEN');
+if (!CLIENT_ID) throw new Error('Missing CLIENT_ID');
 
-// Audio path & volume (JOIN_AUDIO/JOIN_VOLUME aliases supported)
-const SOUND_FILE = process.env.SOUND_FILE || process.env.JOIN_AUDIO || 'sounds/The Going Merry One Piece.ogg';
-const JOIN_VOLUME = (() => {
-  const v = parseFloat(process.env.JOIN_VOLUME);
-  if (Number.isFinite(v)) return Math.max(0, Math.min(2, v)); // clamp 0..2
-  return 0.75;
-})();
-
-// Cooldown ms and debug flag
-const COOLDOWN_MS = Number(process.env.COOLDOWN_MS || 8000);
-const DEBUG = ['1','true','yes','on'].includes(String(process.env.DEBUG || '').toLowerCase());
-
-if (!TOKEN) {
-  throw new Error('Missing DISCORD_TOKEN (or TOKEN) in environment');
-}
-
-// === Resolve watchers from env or watchers.json ===
-function loadWatchersFromFile() {
-  try {
-    const raw = fs.readFileSync('watchers.json', 'utf8');
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed.watchers) && parsed.watchers.length === 2) {
-      return parsed.watchers.map(String);
-    }
-  } catch {}
-  return [];
-}
-function saveWatchersToFile(ids) {
-  try { fs.writeFileSync('watchers.json', JSON.stringify({ watchers: ids }, null, 2)); } catch {}
-}
-
-let watchers = [];
-const fromCombined = ENV_COMBINED.split(',').map(s => s.trim()).filter(Boolean);
-const fromUserAB = [ENV_USER_A, ENV_USER_B].filter(Boolean);
-if (fromCombined.length === 2) watchers = fromCombined.map(String);
-else if (fromUserAB.length === 2) watchers = fromUserAB.map(String);
-else watchers = loadWatchersFromFile();
-
-if (!fs.existsSync(SOUND_FILE)) {
-  console.warn(`[WARN] Join sound not found: ${SOUND_FILE}. Bot will join silently.`);
-}
-
+// -----------------------------
+// Client & Session State
+// -----------------------------
 const client = new Client({
   intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.Guilds,          // slash commands & channel access
+    GatewayIntentBits.GuildMessages,   // to post relayed messages into guild channels
+    GatewayIntentBits.DirectMessages,  // to receive DMs from users
   ],
-  partials: [],
+  partials: [Partials.Channel],        // required to receive DMs
+  allowedMentions: { parse: ['users'], repliedUser: false },
 });
 
-// Track last join time per guild to prevent rapid re-joins
-const lastJoinAt = new Map(); // guildId -> timestamp
+// dmChannelId -> session
+// session = { originChannelId, targetUserId, invokerId, expiresAt }
+const sessionsByDM = new Map();
 
-function log(...args) { console.log('[PC]', ...args); }
+// Clean expired sessions periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [dmId, s] of sessionsByDM.entries()) {
+    if (now > s.expiresAt) sessionsByDM.delete(dmId);
+  }
+}, 30_000);
 
-let booted = false;
-async function onReady() {
-  if (booted) return;
-  booted = true;
+// -----------------------------
+// Slash Commands
+// -----------------------------
+const dmrelayCmd = new SlashCommandBuilder()
+  .setName('dmrelay')
+  .setDescription('DM a user and relay their DM replies back into this channel for a while.')
+  .addUserOption(opt =>
+    opt.setName('user')
+      .setDescription('Who to DM')
+      .setRequired(true))
+  .addStringOption(opt =>
+    opt.setName('message')
+      .setDescription('What to send them')
+      .setRequired(true))
+  .addIntegerOption(opt =>
+    opt.setName('timeout_minutes')
+      .setDescription('How long to keep relaying replies (default 10, max 120)')
+      .setMinValue(1)
+      .setMaxValue(120)
+      .setRequired(false));
 
-  log(`Logged in as ${client.user.tag}.`);
-  if (watchers.length === 2) {
-    log(`Watching ${watchers[0]} & ${watchers[1]}.`);
+const endrelayCmd = new SlashCommandBuilder()
+  .setName('endrelay')
+  .setDescription('Stop relaying replies for a previously started /dmrelay session.')
+  .addUserOption(opt =>
+    opt.setName('user')
+      .setDescription('Which user’s relay to stop')
+      .setRequired(true));
+
+async function registerCommands() {
+  const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+  const body = [dmrelayCmd, endrelayCmd].map(c => c.toJSON());
+
+  if (GUILD_ID) {
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body });
+    console.log(`[CMD] Registered guild commands in ${GUILD_ID}`);
   } else {
-    log('No watcher IDs configured yet. Use /pc_set to configure two users, or set WATCH_IDS / USER_A_ID+USER_B_ID and restart.');
-  }
-
-  if (DEBUG) {
-    log('DEBUG env snapshot:', {
-      DISCORD_TOKEN: TOKEN ? '***' : 'missing',
-      USER_A_ID: process.env.USER_A_ID,
-      USER_B_ID: process.env.USER_B_ID,
-      WATCH_IDS: ENV_COMBINED,
-      SOUND_FILE,
-      JOIN_VOLUME,
-      COOLDOWN_MS,
-    });
-  }
-
-  // Presence
-  client.user.setPresence({ activities: [{ name: 'youeatra', type: ActivityType.Watching }], status: 'online' });
-
-  // Register guild slash commands for instant availability
-  const commands = [
-    {
-      name: 'pc_set', description: 'Set the two watched users',
-      options: [
-        { name: 'user1', description: 'First user', type: 6, required: true },
-        { name: 'user2', description: 'Second user', type: 6, required: true },
-      ],
-    },
-    { name: 'pc_status', description: 'Show current watched users' },
-    { name: 'pc_clear', description: 'Clear watched users' },
-  ];
-
-  for (const [, guild] of client.guilds.cache) {
-    try {
-      await guild.commands.set(commands);
-      if (DEBUG) log(`Slash commands registered in guild: ${guild.name}`);
-    } catch (e) {
-      console.error('[PC] Failed to register commands:', e?.message || e);
-    }
-  }
-
-  // Initial scan
-  for (const [, guild] of client.guilds.cache) {
-    try {
-      await evaluateGuild(guild);
-    } catch (e) {
-      console.error('[PC] Initial evaluateGuild error:', e?.message || e);
-    }
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body });
+    console.log('[CMD] Registered global commands');
   }
 }
 
-client.once('clientReady', onReady); // use clientReady only to avoid deprecation warning
-
-client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
+// -----------------------------
+// Event Wiring
+// -----------------------------
+client.once(Events.ClientReady, async (c) => {
+  console.log(`[READY] Logged in as ${c.user.tag}`);
   try {
-    if (interaction.commandName === 'pc_set') {
-      const u1 = interaction.options.getUser('user1');
-      const u2 = interaction.options.getUser('user2');
-      if (!u1 || !u2 || u1.bot || u2.bot || u1.id === u2.id) {
-        return interaction.reply({ content: 'Pick **two different human** users.', ephemeral: true });
+    await registerCommands();
+  } catch (err) {
+    console.error('[CMD] Failed to register commands:', err);
+  }
+});
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  try {
+    if (!interaction.isChatInputCommand()) return;
+
+    if (interaction.commandName === 'dmrelay') {
+      const target = interaction.options.getUser('user', true);
+      const text = interaction.options.getString('message', true);
+      const timeout = interaction.options.getInteger('timeout_minutes') ?? 10;
+
+      // Create/ensure DM and send initial message
+      let dm;
+      try {
+        dm = await target.createDM();
+      } catch (e) {
+        await interaction.reply({ content: `❌ I can’t DM ${target}. They may have DMs closed.`, ephemeral: true });
+        return;
       }
-      watchers = [u1.id, u2.id];
-      saveWatchersToFile(watchers);
-      await interaction.reply({ content: `Watching <@${u1.id}> & <@${u2.id}>.`, ephemeral: true });
-      await evaluateGuild(interaction.guild);
-      return;
+
+      const originChannelId = interaction.channelId;
+      const expiresAt = Date.now() + timeout * 60_000;
+
+      // Record the relay session keyed by the DM channel id
+      sessionsByDM.set(dm.id, {
+        originChannelId,
+        targetUserId: target.id,
+        invokerId: interaction.user.id,
+        expiresAt,
+      });
+
+      // Notify the target in DM
+      const originChannel = await interaction.client.channels.fetch(originChannelId).catch(() => null);
+      const originChannelName = originChannel?.name ? `#${originChannel.name}` : 'the channel';
+
+      const intro =
+        `**${interaction.user.tag}** asked me to reach out.\n` +
+        `Reply here and I’ll relay your messages back to **${originChannelName}** for the next **${timeout} min**.\n\n` +
+        `**Message from ${interaction.user.tag}:** ${text}`;
+
+      try {
+        await dm.send({ content: intro });
+      } catch (e) {
+        sessionsByDM.delete(dm.id);
+        await interaction.reply({ content: `❌ I couldn’t send a DM to ${target}. They may have DMs closed.`, ephemeral: true });
+        return;
+      }
+
+      await interaction.reply({
+        content: `✅ DM sent to ${target}. I’ll relay their replies here for **${timeout} min**.\nUse \`/endrelay\` to stop early.`,
+        ephemeral: false,
+      });
     }
-    if (interaction.commandName === 'pc_status') {
-      if (watchers.length === 2) {
-        return interaction.reply({ content: `Currently watching: <@${watchers[0]}> & <@${watchers[1]}>`, ephemeral: true });
+
+    if (interaction.commandName === 'endrelay') {
+      const target = interaction.options.getUser('user', true);
+      // Find DM channel for the target and remove session
+      const dm = await target.createDM().catch(() => null);
+      if (!dm) {
+        await interaction.reply({ content: `⚠️ I can’t open a DM with ${target}. If they had a session, it’s already gone.`, ephemeral: true });
+        return;
+      }
+
+      const existed = sessionsByDM.delete(dm.id);
+      if (existed) {
+        await interaction.reply({ content: `🛑 Relay with ${target} has been stopped.`, ephemeral: true });
       } else {
-        return interaction.reply({ content: 'No watchers set. Use `/pc_set user1:@A user2:@B`.', ephemeral: true });
+        await interaction.reply({ content: `ℹ️ There isn’t an active relay for ${target}.`, ephemeral: true });
       }
     }
-    if (interaction.commandName === 'pc_clear') {
-      watchers = [];
-      saveWatchersToFile(watchers);
-      await interaction.reply({ content: 'Cleared watchers. Use `/pc_set` to configure.', ephemeral: true });
-      try { getVoiceConnection(interaction.guild.id)?.destroy(); } catch {}
-      return;
-    }
-  } catch (e) {
-    console.error('[PC] interaction error:', e?.message || e);
-    if (interaction.deferred || interaction.replied) {
-      try { await interaction.followUp({ content: 'Error handling command.', ephemeral: true }); } catch {}
-    } else {
-      try { await interaction.reply({ content: 'Error handling command.', ephemeral: true }); } catch {}
+
+  } catch (err) {
+    console.error('[INT] Error handling interaction:', err);
+    if (interaction.isRepliable() && !interaction.replied) {
+      await interaction.reply({ content: '❌ Something went wrong handling that command.', ephemeral: true }).catch(() => {});
     }
   }
 });
 
-client.on('voiceStateUpdate', async (oldState, newState) => {
-  const guild = newState.guild || oldState.guild;
-  if (!guild) return;
+// Relay DMs -> origin channel
+client.on(Events.MessageCreate, async (message) => {
+  try {
+    // Only care about DMs from humans
+    if (message.guild) return;            // not a DM
+    if (message.author?.bot) return;
 
-  // If not configured yet, do nothing
-  if (watchers.length !== 2) return;
+    const session = sessionsByDM.get(message.channelId);
+    if (!session) return;
 
-  const userId = newState.id || oldState.id;
-  if (watchers.includes(userId)) {
-    const before = oldState?.channel ? `${oldState.channel?.name} (${oldState.channelId})` : 'none';
-    const after = newState?.channel ? `${newState.channel?.name} (${newState.channelId})` : 'none';
-    log(`Tracked user ${userId} moved: ${before} → ${after}`);
-  }
+    // Ensure this DM is from the expected target user
+    if (message.author.id !== session.targetUserId) return;
 
-  try { await evaluateGuild(guild); } catch (e) {
-    console.error('[PC] evaluateGuild error:', e?.message || e);
+    // Check expiry
+    if (Date.now() > session.expiresAt) {
+      sessionsByDM.delete(message.channelId);
+      return;
+    }
+
+    const origin = await client.channels.fetch(session.originChannelId).catch(() => null);
+    if (!origin || !origin.isTextBased()) {
+      sessionsByDM.delete(message.channelId);
+      return;
+    }
+
+    const contentText = (message.content && message.content.trim().length)
+      ? message.content
+      : '';
+
+    const attachmentUrls = [...message.attachments.values()].map(a => a.url);
+    const stickerNames = [...message.stickers.values()].map(s => s.name);
+
+    let relay = `📩 **Reply from ${message.author.tag}**`;
+    if (contentText) relay += `\n${contentText}`;
+    if (stickerNames.length) relay += `\n[Stickers: ${stickerNames.join(', ')}]`;
+    if (attachmentUrls.length) relay += `\n${attachmentUrls.join('\n')}`;
+
+    await origin.send({ content: relay });
+
+  } catch (err) {
+    console.error('[DM] Error relaying DM:', err);
   }
 });
 
-/**
- * Evaluate a guild to see if the two watched users are alone together in any voice channel.
- */
-async function evaluateGuild(guild) {
-  const existing = getVoiceConnection(guild.id);
-
-  if (watchers.length !== 2) {
-    // Ensure we leave if previously connected
-    if (existing) {
-      try { existing.destroy(); log('Left voice (watchers not configured).'); } catch {}
-    }
-    return;
-  }
-
-  const [W1, W2] = watchers;
-  const voiceChannels = guild.channels.cache.filter(c => c && (c.type === ChannelType.GuildVoice || c.type === ChannelType.GuildStageVoice));
-  let targetChannel = null;
-
-  for (const [, channel] of voiceChannels) {
-    // Build human list using voice state cache (does NOT require privileged member intent)
-    const states = guild.voiceStates.cache.filter(s => s.channelId === channel.id);
-    const ids = [...states.keys()];
-    const botIds = new Set(
-      [...states.values()]
-        .filter(s => (s.member?.user?.bot === true) || s.id === client.user.id)
-        .map(s => s.id)
-    );
-    const humanIds = ids.filter(id => !botIds.has(id));
-
-    const bothInside = humanIds.includes(W1) && humanIds.includes(W2);
-    const onlyTwoHumans = humanIds.length === 2;
-
-    if (DEBUG) {
-      log(`[check] ${channel.name}: humans=${humanIds.length} bots=${botIds.size} total=${ids.length} bothInside=${bothInside} onlyTwoHumans=${onlyTwoHumans}`);
-    }
-
-    if (bothInside && onlyTwoHumans) { targetChannel = channel; break; }
-  }
-
-  if (targetChannel) {
-    const now = Date.now();
-    const prev = lastJoinAt.get(guild.id) || 0;
-    const since = now - prev;
-
-    if (existing && existing.joinConfig.channelId === targetChannel.id) {
-      if (DEBUG) log(`Already connected to #${targetChannel.name}.`);
-      return;
-    }
-
-    if (since < COOLDOWN_MS) {
-      if (DEBUG) log(`Within cooldown (${since}ms < ${COOLDOWN_MS}ms). Skipping re-join.`);
-      return;
-    }
-
-    try { existing?.destroy(); } catch {}
-
-    const connection = joinVoiceChannel({
-      channelId: targetChannel.id,
-      guildId: targetChannel.guild.id,
-      adapterCreator: targetChannel.guild.voiceAdapterCreator,
-      selfDeaf: false,
-      selfMute: false,
-    });
-
-    lastJoinAt.set(guild.id, now);
-    log(`Joined #${targetChannel.name} because ${watchers[0]} & ${watchers[1]} are alone together.`);
-
-    if (!fs.existsSync(SOUND_FILE)) {
-      log('[PC] No JOIN_AUDIO/SOUND_FILE found on disk — skipping audio.');
-      return;
-    }
-
-    try {
-      if (fs.existsSync(SOUND_FILE)) {
-        const player = createAudioPlayer({ behavior: NoSubscriberBehavior.Pause });
-        const resource = createAudioResource(SOUND_FILE, { inlineVolume: true });
-        if (resource.volume) resource.volume.setVolume(JOIN_VOLUME);
-        connection.subscribe(player);
-        player.play(resource);
-        log(`Playing join sound: ${path.basename(SOUND_FILE)} @ volume ${JOIN_VOLUME}`);
-        player.once(AudioPlayerStatus.Idle, () => log('Join sound finished. Staying connected until state changes.'));
-        player.on('error', (e) => console.error('[PC] Audio player error:', e?.message || e));
-      }
-    } catch (e) {
-      console.error('[PC] Failed to play join sound:', e?.message || e);
-    }
-  } else {
-    if (existing) {
-      const ch = guild.channels.cache.get(existing.joinConfig.channelId);
-      try { existing.destroy(); log(`Left #${ch?.name || existing.joinConfig.channelId} (no longer alone together).`); } catch (e) {
-        console.error('[PC] Failed to leave voice:', e?.message || e);
-      }
-    }
-  }
-}
-
-client.on('guildUnavailable', (guild) => {
-  try { getVoiceConnection(guild.id)?.destroy(); } catch {}
+// -----------------------------
+// Start
+// -----------------------------
+client.login(DISCORD_TOKEN).catch((e) => {
+  console.error('[LOGIN] Failed to log in:', e);
+  process.exit(1);
 });
-
-process.on('unhandledRejection', (err) => console.error('[PC] Unhandled rejection:', err));
-process.on('uncaughtException', (err) => console.error('[PC] Uncaught exception:', err));
-
-client.login(TOKEN);
